@@ -219,6 +219,8 @@ const getAvatarLetter = (name: string): string => {
 const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
+const EXPORT_AVATAR_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+type SessionDataSource = 'cache' | 'network' | null
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
   let timer: ReturnType<typeof setTimeout> | null = null
@@ -234,6 +236,39 @@ const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<
       clearTimeout(timer)
     }
   }
+}
+
+const toContactMapFromCaches = (
+  contacts: configService.ContactsListCacheContact[],
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>
+): Record<string, ContactInfo> => {
+  const map: Record<string, ContactInfo> = {}
+  for (const contact of contacts || []) {
+    if (!contact?.username) continue
+    map[contact.username] = {
+      ...contact,
+      avatarUrl: avatarEntries[contact.username]?.avatarUrl
+    }
+  }
+  return map
+}
+
+const toSessionRowsWithContacts = (
+  sessions: AppChatSession[],
+  contactMap: Record<string, ContactInfo>
+): SessionRow[] => {
+  return sessions
+    .map((session) => {
+      const contact = contactMap[session.username]
+      return {
+        ...session,
+        kind: toKindByContactType(session, contact),
+        wechatId: contact?.username || session.username,
+        displayName: contact?.displayName || session.displayName || session.username,
+        avatarUrl: contact?.avatarUrl || session.avatarUrl
+      } as SessionRow
+    })
+    .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
 }
 
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
@@ -300,6 +335,9 @@ function ExportPage() {
   const [isBaseConfigLoading, setIsBaseConfigLoading] = useState(true)
   const [isTaskCenterExpanded, setIsTaskCenterExpanded] = useState(false)
   const [sessions, setSessions] = useState<SessionRow[]>([])
+  const [sessionDataSource, setSessionDataSource] = useState<SessionDataSource>(null)
+  const [sessionContactsUpdatedAt, setSessionContactsUpdatedAt] = useState<number | null>(null)
+  const [sessionAvatarUpdatedAt, setSessionAvatarUpdatedAt] = useState<number | null>(null)
   const [searchKeyword, setSearchKeyword] = useState('')
   const [activeTab, setActiveTab] = useState<ConversationTab>('private')
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set())
@@ -360,6 +398,22 @@ function ExportPage() {
   const exportCacheScopeRef = useRef('default')
   const exportCacheScopeReadyRef = useRef(false)
 
+  const ensureExportCacheScope = useCallback(async (): Promise<string> => {
+    if (exportCacheScopeReadyRef.current) {
+      return exportCacheScopeRef.current
+    }
+    const [myWxid, dbPath] = await Promise.all([
+      configService.getMyWxid(),
+      configService.getDbPath()
+    ])
+    const scopeKey = dbPath || myWxid
+      ? `${dbPath || ''}::${myWxid || ''}`
+      : 'default'
+    exportCacheScopeRef.current = scopeKey
+    exportCacheScopeReadyRef.current = true
+    return scopeKey
+  }, [])
+
   useEffect(() => {
     tasksRef.current = tasks
   }, [tasks])
@@ -389,7 +443,7 @@ function ExportPage() {
   const loadBaseConfig = useCallback(async () => {
     setIsBaseConfigLoading(true)
     try {
-      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount, myWxid, dbPath] = await Promise.all([
+      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedWriteLayout, savedSessionMap, savedContentMap, savedSnsPostCount, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultMedia(),
@@ -401,12 +455,8 @@ function ExportPage() {
         configService.getExportLastSessionRunMap(),
         configService.getExportLastContentRunMap(),
         configService.getExportLastSnsPostCount(),
-        configService.getMyWxid(),
-        configService.getDbPath()
+        ensureExportCacheScope()
       ])
-      const exportCacheScope = `${dbPath || ''}::${myWxid || ''}` || 'default'
-      exportCacheScopeRef.current = exportCacheScope
-      exportCacheScopeReadyRef.current = true
 
       const cachedSnsStats = await configService.getExportSnsStatsCache(exportCacheScope)
 
@@ -446,7 +496,7 @@ function ExportPage() {
     } finally {
       setIsBaseConfigLoading(false)
     }
-  }, [])
+  }, [ensureExportCacheScope])
 
   const loadSnsStats = useCallback(async (options?: { full?: boolean; silent?: boolean }) => {
     if (!options?.silent) {
@@ -506,6 +556,24 @@ function ExportPage() {
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
     try {
+      const scopeKey = await ensureExportCacheScope()
+      if (isStale()) return
+
+      const [cachedContactsItem, cachedAvatarItem] = await Promise.all([
+        configService.getContactsListCache(scopeKey),
+        configService.getContactsAvatarCache(scopeKey)
+      ])
+      if (isStale()) return
+
+      const cachedContacts = cachedContactsItem?.contacts || []
+      const cachedAvatarEntries = cachedAvatarItem?.avatars || {}
+      const cachedContactMap = toContactMapFromCaches(cachedContacts, cachedAvatarEntries)
+      if (cachedContacts.length > 0) {
+        syncContactTypeCounts(Object.values(cachedContactMap))
+      }
+      setSessionContactsUpdatedAt(cachedContactsItem?.updatedAt || null)
+      setSessionAvatarUpdatedAt(cachedAvatarItem?.updatedAt || null)
+
       const connectResult = await window.electronAPI.chat.connect()
       if (!connectResult.success) {
         console.error('连接失败:', connectResult.error)
@@ -517,42 +585,54 @@ function ExportPage() {
       if (isStale()) return
 
       if (sessionsResult.success && sessionsResult.sessions) {
-        const baseSessions = sessionsResult.sessions
-          .map((session) => {
-            return {
-              ...session,
-              kind: toKindByContactType(session),
-              wechatId: session.username,
-              displayName: session.displayName || session.username,
-              avatarUrl: session.avatarUrl
-            } as SessionRow
-          })
-          .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
+        const rawSessions = sessionsResult.sessions
+        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap)
 
         if (isStale()) return
         setSessions(baseSessions)
+        setSessionDataSource(cachedContacts.length > 0 ? 'cache' : 'network')
+        if (cachedContacts.length === 0) {
+          setSessionContactsUpdatedAt(Date.now())
+        }
         setIsLoading(false)
 
         // 后台补齐联系人字段（昵称、头像、类型），不阻塞首屏会话列表渲染。
         setIsSessionEnriching(true)
         void (async () => {
           try {
-            if (isStale()) return
-            const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
-            if (isStale()) return
+            let contactMap = { ...cachedContactMap }
+            let avatarEntries = { ...cachedAvatarEntries }
+            let hasFreshNetworkData = false
 
-            const contacts: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
-            if (contacts.length > 0) {
-              syncContactTypeCounts(contacts)
+            if (isStale()) return
+            if (cachedContacts.length === 0) {
+              const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
+              if (isStale()) return
+
+              const contacts: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
+              if (contacts.length > 0) {
+                hasFreshNetworkData = true
+                syncContactTypeCounts(contacts)
+                const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
+                  map[contact.username] = contact
+                  return map
+                }, {})
+                contactMap = nextContactMap
+                setSessionContactsUpdatedAt(Date.now())
+              }
             }
-            const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
-              map[contact.username] = contact
-              return map
-            }, {})
 
+            const now = Date.now()
             const needsEnrichment = baseSessions
-              .filter(session => !session.avatarUrl || !session.displayName || session.displayName === session.username)
-              .map(session => session.username)
+              .filter((session) => {
+                const contact = contactMap[session.username]
+                const avatarEntry = avatarEntries[session.username]
+                const displayName = contact?.displayName || session.displayName || session.username
+                const avatarUrl = contact?.avatarUrl || session.avatarUrl || avatarEntry?.avatarUrl
+                const shouldRecheckAvatar = !avatarEntry || (now - (avatarEntry.checkedAt || 0) >= EXPORT_AVATAR_RECHECK_INTERVAL_MS)
+                return !avatarUrl || displayName === session.username || shouldRecheckAvatar
+              })
+              .map((session) => session.username)
 
             let extraContactMap: Record<string, { displayName?: string; avatarUrl?: string }> = {}
             if (needsEnrichment.length > 0) {
@@ -563,27 +643,87 @@ function ExportPage() {
               )
               if (enrichResult?.success && enrichResult.contacts) {
                 extraContactMap = enrichResult.contacts
+                hasFreshNetworkData = true
+              }
+            }
+
+            const persistAt = Date.now()
+            for (const contact of Object.values(contactMap)) {
+              const avatarUrl = String(contact.avatarUrl || '').trim()
+              if (!avatarUrl) continue
+              const prev = avatarEntries[contact.username]
+              avatarEntries[contact.username] = {
+                avatarUrl,
+                updatedAt: prev?.avatarUrl === avatarUrl ? prev.updatedAt : persistAt,
+                checkedAt: prev?.checkedAt || persistAt
+              }
+            }
+
+            for (const username of needsEnrichment) {
+              const extra = extraContactMap[username]
+              const prev = avatarEntries[username]
+              if (extra?.avatarUrl) {
+                avatarEntries[username] = {
+                  avatarUrl: extra.avatarUrl,
+                  updatedAt: !prev || prev.avatarUrl !== extra.avatarUrl ? persistAt : prev.updatedAt,
+                  checkedAt: persistAt
+                }
+              } else if (prev) {
+                avatarEntries[username] = {
+                  ...prev,
+                  checkedAt: persistAt
+                }
+              }
+
+              if (!extra) continue
+              const current = contactMap[username]
+              if (!current) continue
+              const nextDisplayName = extra.displayName || current.displayName
+              const nextAvatarUrl = extra.avatarUrl || current.avatarUrl
+              if (nextDisplayName !== current.displayName || nextAvatarUrl !== current.avatarUrl) {
+                contactMap[username] = {
+                  ...current,
+                  displayName: nextDisplayName,
+                  avatarUrl: nextAvatarUrl
+                }
               }
             }
 
             if (isStale()) return
-            const nextSessions = baseSessions
+            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap)
               .map((session) => {
-                const contact = nextContactMap[session.username]
                 const extra = extraContactMap[session.username]
-                const displayName = extra?.displayName || contact?.displayName || session.displayName || session.username
-                const avatarUrl = extra?.avatarUrl || session.avatarUrl || contact?.avatarUrl
+                const displayName = extra?.displayName || session.displayName || session.username
+                const avatarUrl = extra?.avatarUrl || session.avatarUrl
+                if (displayName === session.displayName && avatarUrl === session.avatarUrl) {
+                  return session
+                }
                 return {
                   ...session,
-                  kind: toKindByContactType(session, contact),
-                  wechatId: contact?.username || session.wechatId || session.username,
                   displayName,
                   avatarUrl
                 }
               })
               .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
 
+            const contactsCachePayload = Object.values(contactMap).map((contact) => ({
+              username: contact.username,
+              displayName: contact.displayName || contact.username,
+              remark: contact.remark,
+              nickname: contact.nickname,
+              type: contact.type
+            }))
+
             setSessions(nextSessions)
+            if (contactsCachePayload.length > 0) {
+              await configService.setContactsListCache(scopeKey, contactsCachePayload)
+              setSessionContactsUpdatedAt(persistAt)
+            }
+            await configService.setContactsAvatarCache(scopeKey, avatarEntries)
+            setSessionAvatarUpdatedAt(persistAt)
+            if (hasFreshNetworkData) {
+              setSessionDataSource('network')
+            }
           } catch (enrichError) {
             console.error('导出页补充会话联系人信息失败:', enrichError)
           } finally {
@@ -599,7 +739,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [syncContactTypeCounts])
+  }, [ensureExportCacheScope, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -1151,6 +1291,20 @@ function ExportPage() {
     return '公众号'
   }, [activeTab])
 
+  const sessionContactsUpdatedAtLabel = useMemo(() => {
+    if (!sessionContactsUpdatedAt) return ''
+    return new Date(sessionContactsUpdatedAt).toLocaleString()
+  }, [sessionContactsUpdatedAt])
+
+  const sessionAvatarUpdatedAtLabel = useMemo(() => {
+    if (!sessionAvatarUpdatedAt) return ''
+    return new Date(sessionAvatarUpdatedAt).toLocaleString()
+  }, [sessionAvatarUpdatedAt])
+
+  const sessionAvatarCachedCount = useMemo(() => {
+    return sessions.reduce((count, session) => (session.avatarUrl ? count + 1 : count), 0)
+  }, [sessions])
+
   const renderSessionName = (session: SessionRow) => {
     return (
       <div className="session-cell">
@@ -1450,6 +1604,23 @@ function ExportPage() {
               </div>
             )}
           </div>
+        </div>
+
+        <div className="table-cache-meta">
+          {sessionContactsUpdatedAt && (
+            <span className="meta-item">
+              {sessionDataSource === 'cache' ? '缓存' : '最新'} · 更新于 {sessionContactsUpdatedAtLabel}
+            </span>
+          )}
+          {sessions.length > 0 && (
+            <span className="meta-item">
+              头像缓存 {sessionAvatarCachedCount}/{sessions.length}
+              {sessionAvatarUpdatedAtLabel ? ` · 更新于 ${sessionAvatarUpdatedAtLabel}` : ''}
+            </span>
+          )}
+          {(isLoading || isSessionEnriching) && sessions.length > 0 && (
+            <span className="meta-item syncing">后台同步中...</span>
+          )}
         </div>
 
         {!showInitialSkeleton && (isLoading || isSessionEnriching) && (

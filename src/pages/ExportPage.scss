@@ -472,6 +472,22 @@
   flex-wrap: wrap;
 }
 
+.table-cache-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+
+  .meta-item {
+    color: var(--text-tertiary);
+  }
+
+  .meta-item.syncing {
+    color: var(--primary);
+  }
+}
+
 .table-tabs {
   display: flex;
   gap: 8px;
