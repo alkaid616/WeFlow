@@ -324,6 +324,7 @@ function ChatPage(_props: ChatPageProps) {
 
   // 消息右键菜单
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: Message } | null>(null)
+  const [showMessageInfo, setShowMessageInfo] = useState<Message | null>(null)
   const [editingMessage, setEditingMessage] = useState<{ message: Message, content: string } | null>(null)
 
   // 多选模式
@@ -2735,8 +2736,90 @@ function ChatPage(_props: ChatPageProps) {
               <Trash2 size={16} />
               <span>删除消息</span>
             </div>
+            <div className="menu-item" onClick={() => { setShowMessageInfo(contextMenu.message); setContextMenu(null) }}>
+              <Info size={16} />
+              <span>查看消息信息</span>
+            </div>
           </div>
         </>,
+        document.body
+      )}
+
+      {/* 消息信息弹窗 */}
+      {showMessageInfo && createPortal(
+        <div className="message-info-overlay" onClick={() => setShowMessageInfo(null)}>
+          <div className="message-info-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Info size={18} />
+                <h3 style={{ margin: 0 }}>消息详细信息</h3>
+              </div>
+              <button className="close-btn" onClick={() => setShowMessageInfo(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="info-section">
+                <h4>基础字段</h4>
+                <div className="info-grid">
+                  <div className="info-item"><span className="label">Local ID</span><span className="value select-text">{showMessageInfo.localId}</span></div>
+                  <div className="info-item"><span className="label">Server ID</span><span className="value select-text">{showMessageInfo.serverId}</span></div>
+                  <div className="info-item"><span className="label">Local Type</span><span className="value select-text">{showMessageInfo.localType}</span></div>
+                  <div className="info-item"><span className="label">发送者</span><span className="value select-text">{showMessageInfo.senderUsername || '-'}</span></div>
+                  <div className="info-item"><span className="label">创建时间</span><span className="value select-text">{new Date(showMessageInfo.createTime * 1000).toLocaleString()} ({showMessageInfo.createTime})</span></div>
+                  <div className="info-item"><span className="label">发送状态</span><span className="value select-text">{showMessageInfo.isSend === 1 ? '发送' : '接收'}</span></div>
+                </div>
+              </div>
+
+              {showMessageInfo.imageMd5 && (
+                <div className="info-section">
+                  <h4>图片信息</h4>
+                  <div className="info-grid">
+                    <div className="info-item"><span className="label">Image MD5</span><span className="value select-text code">{showMessageInfo.imageMd5}</span></div>
+                    {showMessageInfo.imageDatName && <div className="info-item"><span className="label">DAT 文件名</span><span className="value select-text code">{showMessageInfo.imageDatName}</span></div>}
+                  </div>
+                </div>
+              )}
+
+              {showMessageInfo.videoMd5 && (
+                <div className="info-section">
+                  <h4>视频信息</h4>
+                  <div className="info-grid">
+                    <div className="info-item"><span className="label">Video MD5</span><span className="value select-text code">{showMessageInfo.videoMd5}</span></div>
+                  </div>
+                </div>
+              )}
+
+              {showMessageInfo.voiceDurationSeconds != null && (
+                <div className="info-section">
+                  <h4>语音信息</h4>
+                  <div className="info-grid">
+                    <div className="info-item"><span className="label">时长</span><span className="value select-text">{showMessageInfo.voiceDurationSeconds}秒</span></div>
+                  </div>
+                </div>
+              )}
+
+              {(showMessageInfo.emojiMd5 || showMessageInfo.emojiCdnUrl) && (
+                <div className="info-section">
+                  <h4>表情包信息</h4>
+                  <div className="info-grid">
+                    {showMessageInfo.emojiMd5 && <div className="info-item"><span className="label">MD5</span><span className="value select-text code">{showMessageInfo.emojiMd5}</span></div>}
+                    {showMessageInfo.emojiCdnUrl && <div className="info-item"><span className="label">CDN URL</span><span className="value select-text code break-all">{showMessageInfo.emojiCdnUrl}</span></div>}
+                  </div>
+                </div>
+              )}
+
+              {(showMessageInfo.rawContent || showMessageInfo.content) && (
+                <div className="info-section">
+                  <h4>原始消息内容</h4>
+                  <div className="raw-content-container">
+                    <pre className="select-text">{showMessageInfo.rawContent || showMessageInfo.content}</pre>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>,
         document.body
       )}
 
