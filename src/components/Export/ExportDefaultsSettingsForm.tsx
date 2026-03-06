@@ -245,6 +245,50 @@ export function ExportDefaultsSettingsForm({
         }}
       />
 
+      <div className="form-group">
+        <div className="form-copy">
+          <label>Excel 列显示</label>
+          <span className="form-hint">控制 Excel 导出的列字段</span>
+        </div>
+        <div className="form-control">
+          <div className="select-field" ref={exportExcelColumnsDropdownRef}>
+            <button
+              type="button"
+              className={`select-trigger ${showExportExcelColumnsSelect ? 'open' : ''}`}
+              onClick={() => {
+                setShowExportExcelColumnsSelect(!showExportExcelColumnsSelect)
+                setIsExportDateRangeDialogOpen(false)
+              }}
+            >
+              <span className="select-value">{exportExcelColumnsLabel}</span>
+              <ChevronDown size={16} />
+            </button>
+            {showExportExcelColumnsSelect && (
+              <div className="select-dropdown">
+                {exportExcelColumnOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`select-option ${exportExcelColumnsValue === option.value ? 'active' : ''}`}
+                    onClick={async () => {
+                      const compact = option.value === 'compact'
+                      setExportDefaultExcelCompactColumns(compact)
+                      await configService.setExportDefaultExcelCompactColumns(compact)
+                      onDefaultsChanged?.({ excelCompactColumns: compact })
+                      notify(compact ? '已启用精简列' : '已启用完整列', true)
+                      setShowExportExcelColumnsSelect(false)
+                    }}
+                  >
+                    <span className="option-label">{option.label}</span>
+                    <span className="option-desc">{option.desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
       <div className="form-group media-setting-group">
         <div className="form-copy">
           <label>默认导出媒体内容</label>
@@ -308,50 +352,6 @@ export function ExportDefaultsSettingsForm({
               />
               表情包
             </label>
-          </div>
-        </div>
-      </div>
-
-      <div className="form-group">
-        <div className="form-copy">
-          <label>Excel 列显示</label>
-          <span className="form-hint">控制 Excel 导出的列字段</span>
-        </div>
-        <div className="form-control">
-          <div className="select-field" ref={exportExcelColumnsDropdownRef}>
-            <button
-              type="button"
-              className={`select-trigger ${showExportExcelColumnsSelect ? 'open' : ''}`}
-              onClick={() => {
-                setShowExportExcelColumnsSelect(!showExportExcelColumnsSelect)
-                setIsExportDateRangeDialogOpen(false)
-              }}
-            >
-              <span className="select-value">{exportExcelColumnsLabel}</span>
-              <ChevronDown size={16} />
-            </button>
-            {showExportExcelColumnsSelect && (
-              <div className="select-dropdown">
-                {exportExcelColumnOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`select-option ${exportExcelColumnsValue === option.value ? 'active' : ''}`}
-                    onClick={async () => {
-                      const compact = option.value === 'compact'
-                      setExportDefaultExcelCompactColumns(compact)
-                      await configService.setExportDefaultExcelCompactColumns(compact)
-                      onDefaultsChanged?.({ excelCompactColumns: compact })
-                      notify(compact ? '已启用精简列' : '已启用完整列', true)
-                      setShowExportExcelColumnsSelect(false)
-                    }}
-                  >
-                    <span className="option-label">{option.label}</span>
-                    <span className="option-desc">{option.desc}</span>
-                  </button>
-                ))}
-              </div>
-            )}
           </div>
         </div>
       </div>
