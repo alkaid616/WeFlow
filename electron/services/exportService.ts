@@ -107,6 +107,15 @@ interface MediaExportItem {
   posterDataUrl?: string
 }
 
+interface ExportDisplayProfile {
+  wxid: string
+  nickname: string
+  remark: string
+  alias: string
+  groupNickname: string
+  displayName: string
+}
+
 type MessageCollectMode = 'full' | 'text-fast' | 'media-fast'
 type MediaContentType = 'voice' | 'image' | 'video' | 'emoji'
 
@@ -857,6 +866,50 @@ class ExportService {
         return nickname || wxid
       default:
         return nickname || wxid
+    }
+  }
+
+  private async resolveExportDisplayProfile(
+    wxid: string,
+    preference: ExportOptions['displayNamePreference'],
+    getContact: (username: string) => Promise<{ success: boolean; contact?: any; error?: string }>,
+    groupNicknamesMap: Map<string, string>,
+    fallbackDisplayName = '',
+    extraGroupNicknameCandidates: Array<string | undefined | null> = []
+  ): Promise<ExportDisplayProfile> {
+    const resolvedWxid = String(wxid || '').trim() || String(fallbackDisplayName || '').trim() || 'unknown'
+    const contactResult = resolvedWxid ? await getContact(resolvedWxid) : { success: false as const }
+    const contact = contactResult.success ? contactResult.contact : null
+    const nickname = String(contact?.nickName || contact?.nick_name || fallbackDisplayName || resolvedWxid)
+    const remark = String(contact?.remark || '')
+    const alias = String(contact?.alias || '')
+    const groupNickname = this.resolveGroupNicknameByCandidates(
+      groupNicknamesMap,
+      [
+        resolvedWxid,
+        contact?.username,
+        contact?.userName,
+        contact?.encryptUsername,
+        contact?.encryptUserName,
+        alias,
+        ...extraGroupNicknameCandidates
+      ]
+    ) || ''
+    const displayName = this.getPreferredDisplayName(
+      resolvedWxid,
+      nickname,
+      remark,
+      groupNickname,
+      preference || 'remark'
+    )
+
+    return {
+      wxid: resolvedWxid,
+      nickname,
+      remark,
+      alias,
+      groupNickname,
+      displayName
     }
   }
 
@@ -3282,8 +3335,19 @@ class ExportService {
 
       const cleanedMyWxid = conn.cleanedWxid
       const isGroup = sessionId.includes('@chatroom')
+      const rawMyWxid = String(this.configService.get('myWxid') || '').trim()
 
       const sessionInfo = await this.getContactInfo(sessionId)
+      const myInfo = await this.getContactInfo(cleanedMyWxid)
+      const contactCache = new Map<string, { success: boolean; contact?: any; error?: string }>()
+      const getContactCached = async (username: string) => {
+        if (contactCache.has(username)) {
+          return contactCache.get(username)!
+        }
+        const result = await wcdbService.getContact(username)
+        contactCache.set(username, result)
+        return result
+      }
 
       onProgress?.({
         current: 0,
@@ -3318,6 +3382,18 @@ class ExportService {
       if (options.exportVoiceAsText && voiceMessages.length > 0) {
         await this.ensureVoiceModel(onProgress)
       }
+
+      const senderUsernames = new Set<string>()
+      let senderScanIndex = 0
+      for (const msg of allMessages) {
+        if ((senderScanIndex++ & 0x7f) === 0) {
+          this.throwIfStopRequested(control)
+        }
+        if (msg.senderUsername) senderUsernames.add(msg.senderUsername)
+      }
+      senderUsernames.add(sessionId)
+      senderUsernames.add(cleanedMyWxid)
+      await this.preloadContacts(senderUsernames, contactCache)
 
       if (isGroup) {
         this.throwIfStopRequested(control)
@@ -3449,6 +3525,7 @@ class ExportService {
       })
 
       const chatLabMessages: ChatLabMessage[] = []
+      const senderProfileMap = new Map<string, ExportDisplayProfile>()
       let messageIndex = 0
       for (const msg of allMessages) {
         if ((messageIndex++ & 0x7f) === 0) {
@@ -3464,6 +3541,26 @@ class ExportService {
         const groupNickname = memberInfo.groupNickname
           || (isGroup ? this.resolveGroupNicknameByCandidates(groupNicknamesMap, [msg.senderUsername]) : '')
           || ''
+        const senderProfile = isGroup
+          ? await this.resolveExportDisplayProfile(
+            msg.senderUsername || cleanedMyWxid,
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            msg.isSend ? (myInfo.displayName || cleanedMyWxid) : (memberInfo.accountName || msg.senderUsername || ''),
+            msg.isSend ? [rawMyWxid, cleanedMyWxid] : []
+          )
+          : {
+            wxid: msg.senderUsername || cleanedMyWxid,
+            nickname: memberInfo.accountName || msg.senderUsername || '',
+            remark: '',
+            alias: '',
+            groupNickname,
+            displayName: memberInfo.accountName || msg.senderUsername || ''
+          }
+        if (senderProfile.wxid && !senderProfileMap.has(senderProfile.wxid)) {
+          senderProfileMap.set(senderProfile.wxid, senderProfile)
+        }
 
         // 确定消息内容
         let content: string | null
@@ -3504,8 +3601,8 @@ class ExportService {
 
         const message: ChatLabMessage = {
           sender: msg.senderUsername,
-          accountName: memberInfo.accountName,
-          groupNickname: groupNickname || undefined,
+          accountName: senderProfile.displayName || memberInfo.accountName,
+          groupNickname: (senderProfile.groupNickname || groupNickname) || undefined,
           timestamp: msg.createTime,
           type: this.convertMessageType(msg.localType, msg.content),
           content: content
@@ -3621,10 +3718,27 @@ class ExportService {
         : new Map<string, string>()
 
       const sessionAvatar = avatarMap.get(sessionId)
-      const members = Array.from(collected.memberSet.values()).map((info) => {
+      const members = await Promise.all(Array.from(collected.memberSet.values()).map(async (info) => {
+        const profile = isGroup
+          ? (senderProfileMap.get(info.member.platformId) || await this.resolveExportDisplayProfile(
+            info.member.platformId,
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            info.member.accountName || info.member.platformId,
+            this.isSameWxid(info.member.platformId, cleanedMyWxid) ? [rawMyWxid, cleanedMyWxid] : []
+          ))
+          : null
+        const member = profile
+          ? {
+            ...info.member,
+            accountName: profile.displayName || info.member.accountName,
+            groupNickname: profile.groupNickname || info.member.groupNickname
+          }
+          : info.member
         const avatar = avatarMap.get(info.member.platformId)
-        return avatar ? { ...info.member, avatar } : info.member
-      })
+        return avatar ? { ...member, avatar } : member
+      }))
 
       const { chatlab, meta } = this.getExportMeta(sessionId, sessionInfo, isGroup, sessionAvatar)
 
@@ -3697,6 +3811,7 @@ class ExportService {
 
       const cleanedMyWxid = conn.cleanedWxid
       const isGroup = sessionId.includes('@chatroom')
+      const rawMyWxid = String(this.configService.get('myWxid') || '').trim()
 
       const sessionInfo = await this.getContactInfo(sessionId)
       const myInfo = await this.getContactInfo(cleanedMyWxid)
@@ -4512,13 +4627,14 @@ class ExportService {
       }
 
       // 预加载群昵称 (仅群聊且完整列模式)
-      const groupNicknameCandidates = (isGroup && !useCompactColumns)
+      const groupNicknameCandidates = isGroup
         ? this.buildGroupNicknameIdCandidates([
           ...collected.rows.map(msg => msg.senderUsername),
-          cleanedMyWxid
+          cleanedMyWxid,
+          rawMyWxid
         ])
         : []
-      const groupNicknamesMap = (isGroup && !useCompactColumns)
+      const groupNicknamesMap = isGroup
         ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
@@ -4637,30 +4753,26 @@ class ExportService {
         let senderRemark: string = ''
         let senderGroupNickname: string = ''  // 群昵称
 
-
-        if (msg.isSend) {
+        if (isGroup) {
+          const senderProfile = await this.resolveExportDisplayProfile(
+            msg.isSend ? cleanedMyWxid : (msg.senderUsername || cleanedMyWxid),
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            msg.isSend ? (myInfo.displayName || cleanedMyWxid) : (msg.senderUsername || ''),
+            msg.isSend ? [rawMyWxid, cleanedMyWxid] : []
+          )
+          senderWxid = senderProfile.wxid
+          senderNickname = senderProfile.nickname
+          senderRemark = senderProfile.remark
+          senderGroupNickname = senderProfile.groupNickname
+          senderRole = senderProfile.displayName
+        } else if (msg.isSend) {
           // 我发送的消息
           senderRole = '我'
           senderWxid = cleanedMyWxid
           senderNickname = myInfo.displayName || cleanedMyWxid
           senderRemark = ''
-        } else if (isGroup && msg.senderUsername) {
-          // 群消息
-          senderWxid = msg.senderUsername
-
-          // 用 getContact 获取联系人详情，分别取昵称和备注
-          const contactDetail = await getContactCached(msg.senderUsername)
-          if (contactDetail.success && contactDetail.contact) {
-            // nickName 才是真正的昵称
-            senderNickname = contactDetail.contact.nickName || msg.senderUsername
-            senderRemark = contactDetail.contact.remark || ''
-            // 身份：有备注显示备注，没有显示昵称
-            senderRole = senderRemark || senderNickname
-          } else {
-            senderNickname = msg.senderUsername
-            senderRemark = ''
-            senderRole = msg.senderUsername
-          }
         } else {
           // 单聊对方消息 - 用 getContact 获取联系人详情
           senderWxid = sessionId
@@ -4675,12 +4787,6 @@ class ExportService {
             senderRole = senderNickname
           }
         }
-
-        // 获取群昵称 (仅群聊且完整列模式)
-        if (isGroup && !useCompactColumns && senderWxid) {
-          senderGroupNickname = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [senderWxid])
-        }
-
 
         const row = worksheet.getRow(currentRow)
         row.height = 24
@@ -4857,6 +4963,7 @@ class ExportService {
 
       const cleanedMyWxid = conn.cleanedWxid
       const isGroup = sessionId.includes('@chatroom')
+      const rawMyWxid = String(this.configService.get('myWxid') || '').trim()
       const sessionInfo = await this.getContactInfo(sessionId)
       const myInfo = await this.getContactInfo(cleanedMyWxid)
 
@@ -4919,7 +5026,8 @@ class ExportService {
         ? this.buildGroupNicknameIdCandidates([
           ...Array.from(senderUsernames.values()),
           ...collected.rows.map(msg => msg.senderUsername),
-          cleanedMyWxid
+          cleanedMyWxid,
+          rawMyWxid
         ])
         : []
       const groupNicknamesMap = isGroup
@@ -5077,21 +5185,23 @@ class ExportService {
         let senderNickname: string
         let senderRemark = ''
 
-        if (msg.isSend) {
+        if (isGroup) {
+          const senderProfile = await this.resolveExportDisplayProfile(
+            msg.isSend ? cleanedMyWxid : (msg.senderUsername || cleanedMyWxid),
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            msg.isSend ? (myInfo.displayName || cleanedMyWxid) : (msg.senderUsername || ''),
+            msg.isSend ? [rawMyWxid, cleanedMyWxid] : []
+          )
+          senderWxid = senderProfile.wxid
+          senderNickname = senderProfile.nickname
+          senderRemark = senderProfile.remark
+          senderRole = senderProfile.displayName
+        } else if (msg.isSend) {
           senderRole = '我'
           senderWxid = cleanedMyWxid
           senderNickname = myInfo.displayName || cleanedMyWxid
-        } else if (isGroup && msg.senderUsername) {
-          senderWxid = msg.senderUsername
-          const contactDetail = await getContactCached(msg.senderUsername)
-          if (contactDetail.success && contactDetail.contact) {
-            senderNickname = contactDetail.contact.nickName || msg.senderUsername
-            senderRemark = contactDetail.contact.remark || ''
-            senderRole = senderRemark || senderNickname
-          } else {
-            senderNickname = msg.senderUsername
-            senderRole = msg.senderUsername
-          }
         } else {
           senderWxid = sessionId
           const contactDetail = await getContactCached(sessionId)
@@ -5163,6 +5273,7 @@ class ExportService {
 
       const cleanedMyWxid = conn.cleanedWxid
       const isGroup = sessionId.includes('@chatroom')
+      const rawMyWxid = String(this.configService.get('myWxid') || '').trim()
       const sessionInfo = await this.getContactInfo(sessionId)
       const myInfo = await this.getContactInfo(cleanedMyWxid)
 
@@ -5214,7 +5325,8 @@ class ExportService {
         ? this.buildGroupNicknameIdCandidates([
           ...Array.from(senderUsernames.values()),
           ...collected.rows.map(msg => msg.senderUsername),
-          cleanedMyWxid
+          cleanedMyWxid,
+          rawMyWxid
         ])
         : []
       const groupNicknamesMap = isGroup
@@ -5344,7 +5456,17 @@ class ExportService {
         }
 
         let talker = myInfo.displayName || '我'
-        if (!msg.isSend) {
+        if (isGroup) {
+          const senderProfile = await this.resolveExportDisplayProfile(
+            msg.isSend ? cleanedMyWxid : senderWxid,
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            msg.isSend ? (myInfo.displayName || cleanedMyWxid) : senderWxid,
+            msg.isSend ? [rawMyWxid, cleanedMyWxid] : []
+          )
+          talker = senderProfile.displayName
+        } else if (!msg.isSend) {
           const contactDetail = await getContactCached(senderWxid)
           const senderNickname = contactDetail.success && contactDetail.contact
             ? (contactDetail.contact.nickName || senderWxid)
@@ -5584,7 +5706,8 @@ class ExportService {
         ? this.buildGroupNicknameIdCandidates([
           ...Array.from(senderUsernames.values()),
           ...collected.rows.map(msg => msg.senderUsername),
-          cleanedMyWxid
+          cleanedMyWxid,
+          rawMyWxid
         ])
         : []
       const groupNicknamesMap = isGroup
@@ -5792,11 +5915,16 @@ class ExportService {
 
         const isSenderMe = msg.isSend
         const senderInfo = collected.memberSet.get(msg.senderUsername)?.member
-        const senderName = isSenderMe
-          ? (myInfo.displayName || '我')
-          : (isGroup
-            ? (senderInfo?.groupNickname || senderInfo?.accountName || msg.senderUsername)
-            : (sessionInfo.displayName || sessionId))
+        const senderName = isGroup
+          ? (await this.resolveExportDisplayProfile(
+            isSenderMe ? cleanedMyWxid : (msg.senderUsername || cleanedMyWxid),
+            options.displayNamePreference,
+            getContactCached,
+            groupNicknamesMap,
+            isSenderMe ? (myInfo.displayName || cleanedMyWxid) : (senderInfo?.accountName || msg.senderUsername || ''),
+            isSenderMe ? [rawMyWxid, cleanedMyWxid] : []
+          )).displayName
+          : (isSenderMe ? (myInfo.displayName || '我') : (sessionInfo.displayName || sessionId))
 
         const avatarHtml = getAvatarHtml(isSenderMe ? cleanedMyWxid : msg.senderUsername, senderName)
 
