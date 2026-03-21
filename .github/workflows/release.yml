@@ -163,7 +163,7 @@ jobs:
           WF_SIGN_PRIVATE_KEY: ${{ secrets.WF_SIGN_PRIVATE_KEY }}
           WF_SIGNING_REQUIRED: "1"
         run: |
-          npx electron-builder --win nsis --arm64 --publish always --config.artifactName="${productName}-${version}-arm64-Setup.${ext}"
+          npx electron-builder --win nsis --arm64 --publish always '--config.artifactName=${productName}-${version}-arm64-Setup.${ext}'
 
   update-release-notes:
     runs-on: ubuntu-latest
