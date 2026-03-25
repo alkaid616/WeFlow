@@ -2140,6 +2140,13 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle(
+    'groupAnalytics:getGroupMemberAnalytics',
+    async (_, chatroomId: string, memberUsername: string, startTime?: number, endTime?: number) => {
+      return groupAnalyticsService.getGroupMemberAnalytics(chatroomId, memberUsername, startTime, endTime)
+    }
+  )
+
+  ipcMain.handle(
     'groupAnalytics:getGroupMemberMessages',
     async (
       _,
